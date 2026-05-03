@@ -19,11 +19,21 @@ It does not configure upstream routing, `tokenflux`, provider credentials, or Co
 
 ## Commands
 
-Clone the repo and run the platform entrypoint:
+Download the latest release for your platform:
+
+- macOS Apple Silicon: `codex-deepseek-installer-*-macos-arm64.tar.gz`
+- macOS Intel: `codex-deepseek-installer-*-macos-amd64.tar.gz`
+- Linux ARM64: `codex-deepseek-installer-*-linux-arm64.tar.gz`
+- Linux AMD64: `codex-deepseek-installer-*-linux-amd64.tar.gz`
+- Windows ARM64: `codex-deepseek-installer-*-windows-arm64.zip`
+- Windows AMD64: `codex-deepseek-installer-*-windows-amd64.zip`
+
+macOS example:
 
 ```bash
-git clone git@github.com:wuyak/codex-deepseek-installer.git
-cd codex-deepseek-installer
+curl -L -o codex-deepseek-installer-macos-arm64.tar.gz \
+  https://github.com/wuyak/codex-deepseek-installer/releases/latest/download/codex-deepseek-installer-v0.1.0-macos-arm64.tar.gz
+tar -xzf codex-deepseek-installer-macos-arm64.tar.gz
 ./install-macos.sh
 ```
 
@@ -41,13 +51,27 @@ powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 
 Those two entrypoints run with `--skip-statsig` until the Codex App Local Storage paths are verified on real Linux/Windows machines.
 
-If macOS blocks the downloaded binary, remove quarantine from the cloned directory:
+If macOS blocks the downloaded binary, remove quarantine from the extracted directory:
 
 ```bash
 xattr -dr com.apple.quarantine .
 ```
 
-Advanced/debug commands:
+Developer clone:
+
+```bash
+git clone https://github.com/wuyak/codex-deepseek-installer.git
+cd codex-deepseek-installer
+go run . plan --skip-statsig
+```
+
+SSH clone for maintainers:
+
+```bash
+git clone git@github.com:wuyak/codex-deepseek-installer.git
+```
+
+Advanced/debug commands from a source checkout:
 
 ```bash
 go run . install
@@ -76,6 +100,7 @@ Useful flags:
 - Top-level `model_provider = "tokenflux"`.
 - Existing `~/.codex/models_catalog.json`.
 - Codex App must be fully quit before Statsig patching. Use `Cmd+Q`; closing the window is not enough.
+- The installer does not create or configure `tokenflux`; it only verifies that `tokenflux` is already the active top-level provider.
 
 The installer intentionally stops instead of creating a new Codex setup:
 
@@ -123,4 +148,4 @@ If the installer reports that LevelDB is locked, fully quit Codex App with `Cmd+
 ./build-release.sh
 ```
 
-This writes platform binaries and entry scripts into `dist/`.
+This writes platform binaries, platform archives, and `SHA256SUMS` into `dist/`. The source repository intentionally does not track `dist/`; release binaries should be uploaded as GitHub Release assets.
