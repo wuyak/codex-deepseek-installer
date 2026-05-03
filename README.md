@@ -31,7 +31,7 @@ Download the latest release for your platform:
 macOS example:
 
 ```bash
-VERSION=v0.1.1
+VERSION=v0.1.2
 curl -L -o codex-deepseek-installer-macos-arm64.tar.gz \
   "https://github.com/wuyak/codex-deepseek-installer/releases/download/${VERSION}/codex-deepseek-installer-${VERSION}-macos-arm64.tar.gz"
 tar -xzf codex-deepseek-installer-macos-arm64.tar.gz
@@ -156,8 +156,8 @@ This writes platform binaries, platform archives, and `SHA256SUMS` into `dist/`.
 Releases are built by GitHub Actions when a version tag is pushed:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 The release workflow runs tests, builds all platform archives, generates `SHA256SUMS`, creates the GitHub Release, and uploads the assets automatically.
