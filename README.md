@@ -31,8 +31,9 @@ Download the latest release for your platform:
 macOS example:
 
 ```bash
+VERSION=v0.1.1
 curl -L -o codex-deepseek-installer-macos-arm64.tar.gz \
-  https://github.com/wuyak/codex-deepseek-installer/releases/latest/download/codex-deepseek-installer-v0.1.0-macos-arm64.tar.gz
+  "https://github.com/wuyak/codex-deepseek-installer/releases/download/${VERSION}/codex-deepseek-installer-${VERSION}-macos-arm64.tar.gz"
 tar -xzf codex-deepseek-installer-macos-arm64.tar.gz
 ./install-macos.sh
 ```
@@ -149,3 +150,14 @@ If the installer reports that LevelDB is locked, fully quit Codex App with `Cmd+
 ```
 
 This writes platform binaries, platform archives, and `SHA256SUMS` into `dist/`. The source repository intentionally does not track `dist/`; release binaries should be uploaded as GitHub Release assets.
+
+## Maintainer Release Flow
+
+Releases are built by GitHub Actions when a version tag is pushed:
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+The release workflow runs tests, builds all platform archives, generates `SHA256SUMS`, creates the GitHub Release, and uploads the assets automatically.
