@@ -1,0 +1,8 @@
+# Local root build output.
+/codex-deepseek-installer
+
+# OS/editor noise.
+.DS_Store
+*.tmp
+*.log
+
