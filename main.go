@@ -134,8 +134,8 @@ func parseArgs(args []string) (options, error) {
 		args = []string{"install"}
 	}
 	cmd := args[0]
-	if cmd != "install" && cmd != "plan" && cmd != "apply" && cmd != "verify" {
-		return options{}, fmt.Errorf("unknown command %q; use install, plan, apply, or verify", cmd)
+	if !validCommand(cmd) {
+		return options{}, fmt.Errorf("unknown command %q; use install, plan, apply, verify, status, doctor, or repair", cmd)
 	}
 
 	home, err := os.UserHomeDir()
@@ -157,13 +157,39 @@ func parseArgs(args []string) (options, error) {
 	fs.StringVar(&opts.statsigPath, "statsig-path", opts.statsigPath, "Codex App Statsig LevelDB path")
 	fs.BoolVar(&opts.waitForAppExit, "wait-for-app-exit", false, "wait until Codex App releases the Statsig LevelDB lock")
 	fs.BoolVar(&opts.skipStatsig, "skip-statsig", false, "skip Codex App Statsig available_models patch")
-	fs.BoolVar(&opts.openAfter, "open-after", false, "open Codex App after apply")
-	fs.DurationVar(&opts.timeout, "timeout", opts.timeout, "maximum wait time for Codex App to quit during install")
+	fs.BoolVar(&opts.openAfter, "open-after", false, "open Codex App after apply/repair/install")
+	fs.DurationVar(&opts.timeout, "timeout", opts.timeout, "maximum wait time for Codex App to quit during install/repair")
 	if err := fs.Parse(args[1:]); err != nil {
 		return options{}, err
 	}
 	opts.configPathNormalize()
 	return opts, nil
+}
+
+func validCommand(command string) bool {
+	switch command {
+	case "install", "plan", "apply", "verify", "status", "doctor", "repair":
+		return true
+	default:
+		return false
+	}
+}
+
+func readOnlyCommand(command string) bool {
+	switch command {
+	case "plan", "verify", "status", "doctor":
+		return true
+	default:
+		return false
+	}
+}
+
+func patchCommand(command string) bool {
+	return command == "apply" || command == "repair"
+}
+
+func statusCommand(command string) bool {
+	return command == "status" || command == "doctor"
 }
 
 func (o *options) configPathNormalize() {
@@ -201,14 +227,14 @@ func run(opts options) ([]result, error) {
 	if err != nil {
 		return results, err
 	}
-	_ = configPatched
+	needsRepair := configPatched
 
 	catalogReport, catalogPatched, err := handleCatalog(opts.catalogPath, opts.command)
 	results = append(results, catalogReport)
 	if err != nil {
 		return results, err
 	}
-	_ = catalogPatched
+	needsRepair = needsRepair || catalogPatched
 
 	if opts.skipStatsig {
 		results = append(results, result{
@@ -218,16 +244,20 @@ func run(opts options) ([]result, error) {
 				"--skip-statsig was set; Codex App picker may not show DeepSeek until available_models is patched.",
 			},
 		})
+		if opts.command == "doctor" && needsRepair {
+			return results, errors.New("doctor found DeepSeek injection is missing or incomplete; run repair")
+		}
 		return results, nil
 	}
 
-	statsigReport, err := handleStatsig(opts.statsigPath, opts.command, opts.waitForAppExit)
+	statsigReport, err := handleStatsig(opts.statsigPath, opts.command, opts.waitForAppExit, opts.timeout)
 	results = append(results, statsigReport)
 	if err != nil {
 		return results, err
 	}
+	needsRepair = needsRepair || statsigReport.Status == "NEEDS_REPAIR" || statsigReport.Status == "WOULD_CHANGE"
 
-	if opts.command == "apply" && opts.openAfter {
+	if patchCommand(opts.command) && opts.openAfter {
 		if err := exec.Command("open", "-a", "Codex").Run(); err != nil {
 			results = append(results, result{Name: "Open Codex", Status: "WARN", Details: []string{err.Error()}})
 		} else {
@@ -235,6 +265,9 @@ func run(opts options) ([]result, error) {
 		}
 	}
 
+	if opts.command == "doctor" && needsRepair {
+		return results, errors.New("doctor found DeepSeek injection is missing or incomplete; run repair")
+	}
 	return results, nil
 }
 
@@ -273,7 +306,7 @@ func runInstall(opts options) ([]result, error) {
 			results = append(results, result{Name: "Statsig", Status: "FAIL", Details: []string{err.Error()}})
 			return results, err
 		}
-		statsigReport, err := handleStatsig(opts.statsigPath, "apply", false)
+		statsigReport, err := handleStatsig(opts.statsigPath, "apply", false, opts.timeout)
 		results = append(results, statsigReport)
 		if err != nil {
 			return results, err
@@ -315,14 +348,14 @@ func installStartDetails(opts options) []string {
 	if opts.skipStatsig {
 		return append(details, "Config/catalog will be patched; Statsig/App picker patch is skipped.")
 	}
-	return append(details, "Config/catalog will be patched first. Statsig will wait for Codex App to fully quit.")
+	return append(details, "Config/catalog will be patched first. Then Statsig/App picker gets a one-time local injection after Codex App fully quits.")
 }
 
 func installDoneDetails(opts options) []string {
 	if opts.skipStatsig {
 		return []string{"Config/catalog are configured. Statsig/App picker patch was skipped."}
 	}
-	return []string{"DeepSeek model catalog and Codex App picker allowlist are configured."}
+	return []string{"DeepSeek model catalog and Codex App picker allowlist are configured. If Codex App later refreshes Statsig from network and DeepSeek disappears, run repair."}
 }
 
 func runVerifyAfterInstall(opts options) ([]result, error) {
@@ -352,6 +385,17 @@ func handleConfig(configPath, catalogPath, command string) (result, bool, error)
 	if command == "verify" && changed {
 		return result{Name: "Config", Status: "FAIL", Details: []string{fmt.Sprintf("model_catalog_json is not set to %s", catalogPath)}}, false, errors.New("config verification failed")
 	}
+	if statusCommand(command) {
+		status := "OK"
+		details := []string{"model_provider is tokenflux."}
+		if changed {
+			status = "NEEDS_REPAIR"
+			details = append(details, fmt.Sprintf("model_catalog_json is not set to %s; run repair.", catalogPath))
+		} else {
+			details = append(details, fmt.Sprintf("model_catalog_json points to %s.", catalogPath))
+		}
+		return result{Name: "Config", Status: status, Details: details}, changed, nil
+	}
 	if command == "plan" {
 		status := "OK"
 		details := []string{"model_provider is tokenflux."}
@@ -363,7 +407,7 @@ func handleConfig(configPath, catalogPath, command string) (result, bool, error)
 		}
 		return result{Name: "Config", Status: status, Details: details}, changed, nil
 	}
-	if command == "apply" && changed {
+	if patchCommand(command) && changed {
 		if err := backupFile(configPath); err != nil {
 			return result{Name: "Config", Status: "FAIL", Details: []string{fmt.Sprintf("backup failed: %v", err)}}, false, err
 		}
@@ -439,6 +483,14 @@ func handleCatalog(catalogPath, command string) (result, bool, error) {
 	if command == "verify" && changed {
 		return result{Name: "Catalog", Status: "FAIL", Details: append([]string{"DeepSeek model objects are missing or incomplete."}, report...)}, false, errors.New("catalog verification failed")
 	}
+	if statusCommand(command) {
+		status := "OK"
+		if changed {
+			status = "NEEDS_REPAIR"
+			report = append(report, "DeepSeek model objects are missing or incomplete; run repair.")
+		}
+		return result{Name: "Catalog", Status: status, Details: report}, changed, nil
+	}
 	if command == "plan" {
 		status := "OK"
 		if changed {
@@ -446,7 +498,7 @@ func handleCatalog(catalogPath, command string) (result, bool, error) {
 		}
 		return result{Name: "Catalog", Status: status, Details: report}, changed, nil
 	}
-	if command == "apply" && changed {
+	if patchCommand(command) && changed {
 		if err := backupFile(catalogPath); err != nil {
 			return result{Name: "Catalog", Status: "FAIL", Details: []string{fmt.Sprintf("backup failed: %v", err)}}, false, err
 		}
@@ -638,7 +690,7 @@ func modelObjectComplete(m map[string]any, slug string) bool {
 		modelHasPromptFields(m)
 }
 
-func handleStatsig(dbPath, command string, wait bool) (result, error) {
+func handleStatsig(dbPath, command string, wait bool, timeout time.Duration) (result, error) {
 	if runtime.GOOS != "darwin" {
 		return result{Name: "Statsig", Status: "FAIL", Details: []string{"Statsig patch is only supported on macOS in this version."}}, errors.New("unsupported platform")
 	}
@@ -647,47 +699,110 @@ func handleStatsig(dbPath, command string, wait bool) (result, error) {
 	}
 
 	if wait {
-		if err := waitForLevelDB(dbPath, 5*time.Minute); err != nil {
+		if err := waitForLevelDB(dbPath, timeout); err != nil {
 			return result{Name: "Statsig", Status: "FAIL", Details: []string{err.Error()}}, err
 		}
 	}
 
+	locked := false
 	if err := assertLevelDBUnlocked(dbPath); err != nil {
-		details := []string{
-			err.Error(),
-			"Quit Codex App with Cmd+Q. Closing the window is not enough.",
+		if readOnlyCommand(command) {
+			locked = true
+		} else {
+			details := []string{
+				err.Error(),
+				"Quit Codex App with Cmd+Q. Closing the window is not enough.",
+			}
+			if owners := lockOwners(dbPath); len(owners) > 0 {
+				details = append(details, "Lock/process hints:")
+				details = append(details, owners...)
+			}
+			return result{Name: "Statsig", Status: "FAIL", Details: details}, err
 		}
-		if owners := lockOwners(dbPath); len(owners) > 0 {
-			details = append(details, "Lock/process hints:")
-			details = append(details, owners...)
-		}
-		return result{Name: "Statsig", Status: "FAIL", Details: details}, err
 	}
 
-	stats, changed, err := inspectOrPatchStatsig(dbPath, command == "apply")
+	statsigPath := dbPath
+	var snapshotDir string
+	if locked {
+		var err error
+		snapshotDir, err = copyStatsigSnapshot(dbPath)
+		if err != nil {
+			details := []string{
+				fmt.Sprintf("LevelDB is locked and snapshot inspection failed: %v", err),
+				"Quit Codex App with Cmd+Q before repair/apply.",
+			}
+			if owners := lockOwners(dbPath); len(owners) > 0 {
+				details = append(details, "Lock/process hints:")
+				details = append(details, owners...)
+			}
+			return result{Name: "Statsig", Status: "FAIL", Details: details}, err
+		}
+		defer os.RemoveAll(snapshotDir)
+		statsigPath = snapshotDir
+	}
+
+	stats, changed, err := inspectOrPatchStatsig(statsigPath, patchCommand(command))
+	if locked {
+		lockedDetails := []string{
+			"LevelDB is locked by Codex App; inspected a temporary read-only snapshot.",
+			"Quit Codex App with Cmd+Q before running repair/apply.",
+		}
+		if err != nil {
+			if owners := lockOwners(dbPath); len(owners) > 0 {
+				lockedDetails = append(lockedDetails, "Lock/process hints:")
+				lockedDetails = append(lockedDetails, owners...)
+			}
+			return result{Name: "Statsig", Status: "FAIL", Details: append(lockedDetails, err.Error())}, err
+		}
+		statsDetails := stats.Details()
+		statsDetails = append(lockedDetails, statsDetails...)
+		return statsigResult(command, stats, changed, statsDetails)
+	}
 	if err != nil {
 		return result{Name: "Statsig", Status: "FAIL", Details: []string{err.Error()}}, err
 	}
+	return statsigResult(command, stats, changed, stats.Details())
+}
+
+func statsigResult(command string, stats statsigStats, changed bool, details []string) (result, error) {
 	if stats.SeenConfig == 0 {
 		return result{Name: "Statsig", Status: "FAIL", Details: []string{"No Statsig dynamic config 107580212 found; refusing to fabricate unknown schema."}}, errors.New("statsig config not found")
 	}
 	if command == "verify" && !stats.AllPresent {
-		return result{Name: "Statsig", Status: "FAIL", Details: stats.Details()}, errors.New("statsig verification failed")
+		return result{Name: "Statsig", Status: "FAIL", Details: details}, errors.New("statsig verification failed")
+	}
+	if statusCommand(command) {
+		if !stats.AllPresent {
+			return result{Name: "Statsig", Status: "NEEDS_REPAIR", Details: append(details, "DeepSeek models are missing from Statsig available_models; run repair after quitting Codex App.")}, nil
+		}
+		return result{Name: "Statsig", Status: "OK", Details: details}, nil
 	}
 	if command == "plan" {
 		status := "OK"
 		if !stats.AllPresent {
 			status = "WOULD_CHANGE"
 		}
-		return result{Name: "Statsig", Status: status, Details: stats.Details()}, nil
+		return result{Name: "Statsig", Status: status, Details: details}, nil
 	}
-	if command == "apply" {
+	if patchCommand(command) {
 		if changed {
-			return result{Name: "Statsig", Status: "PATCHED", Details: stats.Details()}, nil
+			return result{Name: "Statsig", Status: "PATCHED", Details: details}, nil
 		}
-		return result{Name: "Statsig", Status: "OK", Details: stats.Details()}, nil
+		return result{Name: "Statsig", Status: "OK", Details: details}, nil
 	}
-	return result{Name: "Statsig", Status: "OK", Details: stats.Details()}, nil
+	return result{Name: "Statsig", Status: "OK", Details: details}, nil
+}
+
+func copyStatsigSnapshot(dbPath string) (string, error) {
+	tmp, err := os.MkdirTemp("", "codex-deepseek-statsig-*")
+	if err != nil {
+		return "", err
+	}
+	if err := copyDir(dbPath, tmp); err != nil {
+		os.RemoveAll(tmp)
+		return "", err
+	}
+	return tmp, nil
 }
 
 func waitForLevelDB(path string, timeout time.Duration) error {
@@ -721,7 +836,7 @@ type statsigStats struct {
 
 func (s statsigStats) Details() []string {
 	d := []string{
-		fmt.Sprintf("seenConfig=%d patched=%d alreadyComplete=%d allPresent=%v", s.SeenConfig, s.Patched, s.Already, s.AllPresent),
+		fmt.Sprintf("seenConfig=%d patchCount=%d alreadyComplete=%d allPresent=%v", s.SeenConfig, s.Patched, s.Already, s.AllPresent),
 	}
 	if len(s.Keys) > 0 {
 		sort.Strings(s.Keys)
@@ -777,7 +892,7 @@ func inspectOrPatchStatsigOnce(path string, write bool) (statsigStats, bool, err
 			continue
 		}
 		stats.SeenConfig++
-		stats.Keys = append(stats.Keys, string(key))
+		stats.Keys = append(stats.Keys, printableKey(key))
 		if complete && !changed {
 			stats.Already++
 		}
@@ -795,6 +910,18 @@ func inspectOrPatchStatsigOnce(path string, write bool) (statsigStats, bool, err
 	}
 	stats.AllPresent = stats.SeenConfig > 0 && stats.Patched == 0
 	return stats, stats.Patched > 0, nil
+}
+
+func printableKey(key []byte) string {
+	var b strings.Builder
+	for _, c := range key {
+		if c >= 0x20 && c <= 0x7e {
+			b.WriteByte(c)
+			continue
+		}
+		fmt.Fprintf(&b, "\\x%02x", c)
+	}
+	return b.String()
 }
 
 func splitStoredValue(value []byte) ([]byte, string) {

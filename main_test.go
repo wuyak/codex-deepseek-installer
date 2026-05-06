@@ -4,11 +4,80 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/syndtr/goleveldb/leveldb"
 )
+
+func TestParseArgsAcceptsStatusDoctorRepair(t *testing.T) {
+	for _, cmd := range []string{"status", "doctor", "repair"} {
+		opts, err := parseArgs([]string{cmd, "--skip-statsig"})
+		if err != nil {
+			t.Fatalf("parseArgs(%q) failed: %v", cmd, err)
+		}
+		if opts.command != cmd {
+			t.Fatalf("command = %q, want %q", opts.command, cmd)
+		}
+	}
+	if !readOnlyCommand("status") || !readOnlyCommand("doctor") {
+		t.Fatal("status/doctor should be read-only commands")
+	}
+	if !patchCommand("repair") {
+		t.Fatal("repair should reuse patch command semantics")
+	}
+}
+
+func TestStatusReportsNeedRepairWithoutWritingConfig(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	catalogPath := filepath.Join(dir, "models_catalog.json")
+	original := "model_provider = \"tokenflux\"\nmodel = \"gpt-5.5\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	res, changed, err := handleConfig(configPath, catalogPath, "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != "NEEDS_REPAIR" || !changed {
+		t.Fatalf("status result = %+v changed=%v", res, changed)
+	}
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != original {
+		t.Fatalf("status wrote config unexpectedly:\n%s", after)
+	}
+}
+
+func TestRepairPatchesConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	catalogPath := filepath.Join(dir, "models_catalog.json")
+	if err := os.WriteFile(configPath, []byte("model_provider = \"tokenflux\"\nmodel = \"gpt-5.5\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	res, changed, err := handleConfig(configPath, catalogPath, "repair")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != "PATCHED" || !changed {
+		t.Fatalf("repair result = %+v changed=%v", res, changed)
+	}
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(after), "model_catalog_json = "+strconv.Quote(catalogPath)) {
+		t.Fatalf("repair did not write catalog path:\n%s", after)
+	}
+}
 
 func TestPatchModelCatalogJSONLine(t *testing.T) {
 	in := "model_provider = \"tokenflux\"\nmodel = \"gpt-5.5\"\n\n[model_providers.tokenflux]\nname = \"tokenflux\"\n"
@@ -223,5 +292,13 @@ func TestPatchStatsigLevelDB(t *testing.T) {
 	}
 	if changed || !stats.AllPresent {
 		t.Fatalf("verify stats=%+v changed=%v", stats, changed)
+	}
+}
+
+func TestPrintableKeyEscapesControlBytes(t *testing.T) {
+	got := printableKey([]byte("_app://-\x00\x01statsig.cached.evaluations.test"))
+	want := `_app://-\x00\x01statsig.cached.evaluations.test`
+	if got != want {
+		t.Fatalf("printableKey = %q, want %q", got, want)
 	}
 }

@@ -1,6 +1,8 @@
 # Codex DeepSeek Installer
 
-One-command installer for making Codex App show the two DeepSeek models already routed by a `tokenflux` provider. macOS gets the full App picker patch; Linux and Windows currently patch config/catalog only.
+One-command setup and repeatable repair tool for making Codex App show the two DeepSeek models already routed by a `tokenflux` provider.
+
+macOS patches config/catalog and performs a one-time local App picker injection. Linux and Windows currently patch config/catalog only.
 
 It only patches three local states:
 
@@ -16,6 +18,25 @@ It only patches three local states:
 ```
 
 It does not configure upstream routing, `tokenflux`, provider credentials, or Codex auth. It also does not create a new Codex setup: the machine must already have a working Codex config whose top-level provider is `tokenflux`.
+
+## Important: Picker Injection Is Repairable, Not Permanent
+
+Codex App can refresh its local Statsig cache from the network during app startup, after reboot, or after app updates. When that happens, the local dynamic config can be rewritten back to the official `available_models` list, and the two DeepSeek models can disappear from the App picker even though `~/.codex/config.toml` and `~/.codex/models_catalog.json` are still correct.
+
+This tool treats that as a normal repair case:
+
+```bash
+# Read-only diagnosis. This can inspect a temporary LevelDB snapshot while Codex App is open.
+./codex-deepseek-installer status
+
+# Strict diagnosis for scripts/CI. Exits non-zero if repair is needed.
+./codex-deepseek-installer doctor
+
+# Re-inject config/catalog/Statsig. Quit Codex App with Cmd+Q when prompted.
+./codex-deepseek-installer repair --wait-for-app-exit --open-after
+```
+
+The public repo does not ship or require a private golden LevelDB cache. It patches the current local Statsig `available_models` entry in place after backing it up.
 
 ## Commands
 
@@ -38,7 +59,7 @@ tar -xzf codex-deepseek-installer-macos-arm64.tar.gz
 ./install-macos.sh
 ```
 
-The installer will patch config/catalog, wait for Codex App to be fully quit, patch the App picker allowlist, verify the result, and reopen Codex.
+The installer patches config/catalog, waits for Codex App to be fully quit, performs the one-time App picker injection, verifies the result, and reopens Codex.
 
 Linux and Windows entrypoints exist for config/catalog patching only:
 
@@ -79,6 +100,9 @@ go run . install
 go run . plan
 go run . apply
 go run . verify
+go run . status
+go run . doctor
+go run . repair --wait-for-app-exit --open-after
 ```
 
 Useful flags:
@@ -100,7 +124,7 @@ Useful flags:
 - Existing `~/.codex/config.toml`.
 - Top-level `model_provider = "tokenflux"`.
 - Existing `~/.codex/models_catalog.json`.
-- Codex App must be fully quit before Statsig patching. Use `Cmd+Q`; closing the window is not enough.
+- Codex App must be fully quit before Statsig patching or repair. Use `Cmd+Q`; closing the window is not enough.
 - The installer does not create or configure `tokenflux`; it only verifies that `tokenflux` is already the active top-level provider.
 
 The installer intentionally stops instead of creating a new Codex setup:
@@ -112,7 +136,7 @@ missing ~/.codex/models_catalog.json -> fail
 Codex App still holds LevelDB LOCK  -> fail unless --wait-for-app-exit is set
 ```
 
-`model_catalog_json` is treated as a safe config pointer. If it is missing or points elsewhere, `apply` rewrites only that one top-level line.
+`model_catalog_json` is treated as a safe config pointer. If it is missing or points elsewhere, `apply`/`repair` rewrites only that one top-level line.
 
 ## What Gets Added
 
@@ -136,12 +160,26 @@ context window
 
 ## Safe Flow
 
+Initial setup:
+
 ```bash
-# One-shot install. Quit Codex App with Cmd+Q when prompted.
+# Quit Codex App with Cmd+Q when prompted.
 ./install-macos.sh
 ```
 
-If the installer reports that LevelDB is locked, fully quit Codex App with `Cmd+Q`. Closing the window is not enough. The installer waits by default and does not kill Codex App.
+Check after reboot/update/startup:
+
+```bash
+./codex-deepseek-installer status
+```
+
+If DeepSeek disappears from the Codex App picker:
+
+```bash
+./codex-deepseek-installer repair --wait-for-app-exit --open-after
+```
+
+If the installer reports that LevelDB is locked during repair, fully quit Codex App with `Cmd+Q`. Closing the window is not enough. The installer waits only when `--wait-for-app-exit` is set and never kills Codex App.
 
 ## Build Release Binaries
 
