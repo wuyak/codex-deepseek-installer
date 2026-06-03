@@ -33,4 +33,4 @@ if [[ -z "$BIN" ]]; then
   exit 1
 fi
 
-exec "$BIN" install --open-after "$@"
+exec "$BIN" install "$@"

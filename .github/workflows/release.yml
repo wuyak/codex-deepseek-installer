@@ -30,7 +30,7 @@ jobs:
           cache: true
 
       - name: Check shell scripts
-        run: bash -n build-release.sh install-macos.sh install-linux.sh
+        run: bash -n build-release.sh install-macos.sh
 
       - name: Run tests
         run: go test ./...
@@ -51,10 +51,6 @@ jobs:
           gh release create "$VERSION" \
             dist/codex-deepseek-installer-"$VERSION"-macos-arm64.tar.gz \
             dist/codex-deepseek-installer-"$VERSION"-macos-amd64.tar.gz \
-            dist/codex-deepseek-installer-"$VERSION"-linux-arm64.tar.gz \
-            dist/codex-deepseek-installer-"$VERSION"-linux-amd64.tar.gz \
-            dist/codex-deepseek-installer-"$VERSION"-windows-arm64.zip \
-            dist/codex-deepseek-installer-"$VERSION"-windows-amd64.zip \
             dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --title "$VERSION" \

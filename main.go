@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -20,13 +21,19 @@ import (
 )
 
 const (
-	flashSlug = "deepseek-v4-flash(deepseek)"
-	proSlug   = "deepseek-v4-pro(deepseek)"
+	sparkSlug = "gpt-5.3-codex-spark"
+	flashSlug = "deepseek-v4-flash"
+	proSlug   = "deepseek-v4-pro"
+	humanSlug = "human-llm"
 
 	flashModelName = "deepseek-v4-flash"
 	proModelName   = "deepseek-v4-pro"
+	humanModelName = "human-llm"
 
 	statsigConfigID = "107580212"
+
+	statsigPinnedSource          = "CachePinned"
+	statsigFutureTimestampMillis = float64(4070908800000)
 )
 
 type options struct {
@@ -46,12 +53,15 @@ type result struct {
 	Details []string
 }
 
-type deepseekModel struct {
-	Slug        string
-	ModelName   string
-	DisplayName string
-	Description string
-	Priority    int
+type tokenfluxModel struct {
+	Slug                   string
+	ModelName              string
+	DisplayName            string
+	Description            string
+	Priority               int
+	DefaultReasoningLevel  string
+	ReasoningLevels        []reasoningLevel
+	SupportsReasoningNotes bool
 }
 
 type reasoningLevel struct {
@@ -97,21 +107,50 @@ type catalogModel struct {
 	ModelMessages               map[string]any   `json:"model_messages"`
 }
 
-var deepseekModels = []deepseekModel{
+var tokenfluxModels = []tokenfluxModel{
 	{
-		Slug:        flashSlug,
-		ModelName:   flashModelName,
-		DisplayName: "DeepSeek V4 Flash(deepseek)",
-		Description: "DeepSeek V4 Flash via tokenflux/CPA.",
-		Priority:    12,
+		Slug:                   flashSlug,
+		ModelName:              flashModelName,
+		DisplayName:            "DeepSeek V4 Flash",
+		Description:            "DeepSeek V4 Flash via tokenflux/CPA.",
+		Priority:               12,
+		DefaultReasoningLevel:  "high",
+		ReasoningLevels:        deepseekReasoningLevels(),
+		SupportsReasoningNotes: true,
 	},
 	{
-		Slug:        proSlug,
-		ModelName:   proModelName,
-		DisplayName: "DeepSeek V4 Pro(deepseek)",
-		Description: "DeepSeek V4 Pro via tokenflux/CPA.",
-		Priority:    13,
+		Slug:                   proSlug,
+		ModelName:              proModelName,
+		DisplayName:            "DeepSeek V4 Pro",
+		Description:            "DeepSeek V4 Pro via tokenflux/CPA.",
+		Priority:               13,
+		DefaultReasoningLevel:  "high",
+		ReasoningLevels:        deepseekReasoningLevels(),
+		SupportsReasoningNotes: true,
 	},
+	{
+		Slug:                   humanSlug,
+		ModelName:              humanModelName,
+		DisplayName:            "Human LLM",
+		Description:            "Human-in-the-loop Responses model via tokenflux/CPA.",
+		Priority:               14,
+		DefaultReasoningLevel:  "medium",
+		ReasoningLevels:        codexReasoningLevels(),
+		SupportsReasoningNotes: false,
+	},
+}
+
+var existingCatalogModelSlugs = []string{
+	sparkSlug,
+}
+
+func requiredPickerModelSlugs() []string {
+	slugs := make([]string, 0, len(existingCatalogModelSlugs)+len(tokenfluxModels))
+	slugs = append(slugs, existingCatalogModelSlugs...)
+	for _, spec := range tokenfluxModels {
+		slugs = append(slugs, spec.Slug)
+	}
+	return slugs
 }
 
 func main() {
@@ -147,7 +186,7 @@ func parseArgs(args []string) (options, error) {
 		command:     cmd,
 		codexHome:   filepath.Join(home, ".codex"),
 		catalogPath: filepath.Join(home, ".codex", "models_catalog.json"),
-		statsigPath: filepath.Join(home, "Library", "Application Support", "Codex", "Local Storage", "leveldb"),
+		statsigPath: defaultStatsigPath(home),
 		timeout:     5 * time.Minute,
 	}
 
@@ -164,6 +203,14 @@ func parseArgs(args []string) (options, error) {
 	}
 	opts.configPathNormalize()
 	return opts, nil
+}
+
+func defaultStatsigPath(home string) string {
+	defaultPath := filepath.Join(home, "Library", "Application Support", "Codex", "Default", "Local Storage", "leveldb")
+	if _, err := os.Stat(defaultPath); err == nil {
+		return defaultPath
+	}
+	return filepath.Join(home, "Library", "Application Support", "Codex", "Local Storage", "leveldb")
 }
 
 func validCommand(command string) bool {
@@ -211,8 +258,8 @@ func (o *options) configPathNormalize() {
 }
 
 func run(opts options) ([]result, error) {
-	if runtime.GOOS != "darwin" && !opts.skipStatsig {
-		return nil, fmt.Errorf("first version only supports macOS Statsig patch; rerun with --skip-statsig for config/catalog checks")
+	if runtime.GOOS != "darwin" {
+		return nil, fmt.Errorf("this repair tool is macOS-only; verify the real Codex app cache path and schema before adding support for another OS")
 	}
 
 	if opts.command == "install" {
@@ -241,11 +288,11 @@ func run(opts options) ([]result, error) {
 			Name:   "Statsig",
 			Status: "SKIPPED",
 			Details: []string{
-				"--skip-statsig was set; Codex App picker may not show DeepSeek until available_models is patched.",
+				"--skip-statsig was set; Codex App picker may not show all required models until available_models is patched.",
 			},
 		})
 		if opts.command == "doctor" && needsRepair {
-			return results, errors.New("doctor found DeepSeek injection is missing or incomplete; run repair")
+			return results, errors.New("doctor found required model visibility is missing or incomplete; run repair")
 		}
 		return results, nil
 	}
@@ -258,15 +305,15 @@ func run(opts options) ([]result, error) {
 	needsRepair = needsRepair || statsigReport.Status == "NEEDS_REPAIR" || statsigReport.Status == "WOULD_CHANGE"
 
 	if patchCommand(opts.command) && opts.openAfter {
-		if err := exec.Command("open", "-a", "Codex").Run(); err != nil {
-			results = append(results, result{Name: "Open Codex", Status: "WARN", Details: []string{err.Error()}})
-		} else {
-			results = append(results, result{Name: "Open Codex", Status: "OK", Details: []string{"Codex App open command sent."}})
+		openReport, err := openCodexAfterVerify(opts.statsigPath)
+		results = append(results, openReport)
+		if err != nil {
+			return results, err
 		}
 	}
 
 	if opts.command == "doctor" && needsRepair {
-		return results, errors.New("doctor found DeepSeek injection is missing or incomplete; run repair")
+		return results, errors.New("doctor found required model visibility is missing or incomplete; run repair")
 	}
 	return results, nil
 }
@@ -316,7 +363,7 @@ func runInstall(opts options) ([]result, error) {
 			Name:   "Statsig",
 			Status: "SKIPPED",
 			Details: []string{
-				"--skip-statsig was set; Codex App picker may not show DeepSeek until available_models is patched.",
+				"--skip-statsig was set; Codex App picker may not show all required models until available_models is patched.",
 			},
 		})
 	}
@@ -328,10 +375,10 @@ func runInstall(opts options) ([]result, error) {
 	}
 
 	if opts.openAfter && !opts.skipStatsig {
-		if err := exec.Command("open", "-a", "Codex").Run(); err != nil {
-			results = append(results, result{Name: "Open Codex", Status: "WARN", Details: []string{err.Error()}})
-		} else {
-			results = append(results, result{Name: "Open Codex", Status: "OK", Details: []string{"Codex App open command sent."}})
+		openReport, err := openCodexAfterVerify(opts.statsigPath)
+		results = append(results, openReport)
+		if err != nil {
+			return results, err
 		}
 	}
 
@@ -343,8 +390,21 @@ func runInstall(opts options) ([]result, error) {
 	return results, nil
 }
 
+func openCodexAfterVerify(statsigPath string) (result, error) {
+	verifyReport, err := handleStatsig(statsigPath, "verify", false, 0)
+	if err != nil {
+		details := []string{"Refusing to open Codex App because the current picker cache did not verify."}
+		details = append(details, verifyReport.Details...)
+		return result{Name: "Open Codex", Status: "FAIL", Details: details}, err
+	}
+	if err := exec.Command("open", "-a", "Codex").Run(); err != nil {
+		return result{Name: "Open Codex", Status: "WARN", Details: []string{err.Error()}}, nil
+	}
+	return result{Name: "Open Codex", Status: "OK", Details: []string{"Codex App open command sent after verifying all required models are present in Statsig."}}, nil
+}
+
 func installStartDetails(opts options) []string {
-	details := []string{"Installing DeepSeek model visibility for existing tokenflux Codex config."}
+	details := []string{"Installing TokenFlux/CPA model visibility for existing tokenflux Codex config."}
 	if opts.skipStatsig {
 		return append(details, "Config/catalog will be patched; Statsig/App picker patch is skipped.")
 	}
@@ -355,7 +415,7 @@ func installDoneDetails(opts options) []string {
 	if opts.skipStatsig {
 		return []string{"Config/catalog are configured. Statsig/App picker patch was skipped."}
 	}
-	return []string{"DeepSeek model catalog and Codex App picker allowlist are configured. If Codex App later refreshes Statsig from network and DeepSeek disappears, run repair."}
+	return []string{"TokenFlux/CPA model catalog and Codex App picker allowlist are configured. If Codex App later refreshes Statsig from network and a required model disappears, run repair."}
 }
 
 func runVerifyAfterInstall(opts options) ([]result, error) {
@@ -481,13 +541,13 @@ func handleCatalog(catalogPath, command string) (result, bool, error) {
 		return result{Name: "Catalog", Status: "FAIL", Details: append([]string{err.Error()}, report...)}, false, err
 	}
 	if command == "verify" && changed {
-		return result{Name: "Catalog", Status: "FAIL", Details: append([]string{"DeepSeek model objects are missing or incomplete."}, report...)}, false, errors.New("catalog verification failed")
+		return result{Name: "Catalog", Status: "FAIL", Details: append([]string{"TokenFlux/CPA model objects are missing or incomplete."}, report...)}, false, errors.New("catalog verification failed")
 	}
 	if statusCommand(command) {
 		status := "OK"
 		if changed {
 			status = "NEEDS_REPAIR"
-			report = append(report, "DeepSeek model objects are missing or incomplete; run repair.")
+			report = append(report, "TokenFlux/CPA model objects are missing or incomplete; run repair.")
 		}
 		return result{Name: "Catalog", Status: status, Details: report}, changed, nil
 	}
@@ -536,8 +596,8 @@ func patchCatalog(data []byte) ([]byte, bool, []string, error) {
 
 	changed := false
 	report := []string{fmt.Sprintf("Using %q as Codex prompt/tool template.", stringField(template, "slug"))}
-	for _, spec := range deepseekModels {
-		next := buildDeepSeekModel(template, spec)
+	for _, spec := range tokenfluxModels {
+		next := buildTokenfluxModel(template, spec)
 		idx := indexModel(models, spec.Slug)
 		if idx < 0 {
 			models = append(models, next)
@@ -549,9 +609,25 @@ func patchCatalog(data []byte) ([]byte, bool, []string, error) {
 			models[idx] = next
 			changed = true
 			report = append(report, fmt.Sprintf("Will replace incomplete %s.", spec.Slug))
+		} else if !reflect.DeepEqual(models[idx], next) {
+			models[idx] = next
+			changed = true
+			report = append(report, fmt.Sprintf("Will refresh %s from latest Codex prompt/tool template.", spec.Slug))
 		} else {
 			report = append(report, fmt.Sprintf("%s already complete.", spec.Slug))
 		}
+	}
+	for _, slug := range existingCatalogModelSlugs {
+		idx := indexModel(models, slug)
+		if idx < 0 {
+			report = append(report, fmt.Sprintf("%s is missing from the existing Codex catalog.", slug))
+			return nil, false, report, fmt.Errorf("catalog missing required existing model %s", slug)
+		}
+		if !modelObjectComplete(models[idx], slug) {
+			report = append(report, fmt.Sprintf("%s exists but is incomplete in the existing Codex catalog.", slug))
+			return nil, false, report, fmt.Errorf("catalog has incomplete required existing model %s", slug)
+		}
+		report = append(report, fmt.Sprintf("%s already present.", slug))
 	}
 
 	outModels := make([]any, len(models))
@@ -579,7 +655,7 @@ func selectTemplateModel(models []map[string]any) (map[string]any, error) {
 			return m, nil
 		}
 	}
-	return nil, errors.New("no existing model with base_instructions and model_messages.instructions_template found; refusing to inject bare DeepSeek models")
+	return nil, errors.New("no existing model with base_instructions and model_messages.instructions_template found; refusing to inject bare TokenFlux/CPA model catalog objects")
 }
 
 func modelHasPromptFields(m map[string]any) bool {
@@ -593,15 +669,21 @@ func modelHasPromptFields(m map[string]any) bool {
 	return strings.TrimSpace(stringField(mm, "instructions_template")) != ""
 }
 
-func buildDeepSeekModel(template map[string]any, spec deepseekModel) map[string]any {
-	model := newDeepSeekCatalogModel(template, spec)
+func buildTokenfluxModel(template map[string]any, spec tokenfluxModel) map[string]any {
+	next := deepCopyMap(template)
+	transformPromptValues(next, spec.ModelName)
+
+	model := newTokenfluxCatalogModel(template, spec)
 	data, _ := json.Marshal(model)
-	var next map[string]any
-	_ = json.Unmarshal(data, &next)
+	var canonical map[string]any
+	_ = json.Unmarshal(data, &canonical)
+	for key, value := range canonical {
+		next[key] = value
+	}
 	return next
 }
 
-func newDeepSeekCatalogModel(template map[string]any, spec deepseekModel) catalogModel {
+func newTokenfluxCatalogModel(template map[string]any, spec tokenfluxModel) catalogModel {
 	modelMessages := map[string]any{}
 	if raw, ok := template["model_messages"].(map[string]any); ok {
 		modelMessages = deepCopyMap(raw)
@@ -612,8 +694,8 @@ func newDeepSeekCatalogModel(template map[string]any, spec deepseekModel) catalo
 		Slug:                       spec.Slug,
 		DisplayName:                spec.DisplayName,
 		Description:                spec.Description,
-		DefaultReasoningLevel:      "high",
-		SupportedReasoningLevels:   deepseekReasoningLevels(),
+		DefaultReasoningLevel:      spec.DefaultReasoningLevel,
+		SupportedReasoningLevels:   spec.ReasoningLevels,
 		ShellType:                  "unified_exec",
 		Visibility:                 "list",
 		SupportedInAPI:             true,
@@ -622,7 +704,7 @@ func newDeepSeekCatalogModel(template map[string]any, spec deepseekModel) catalo
 		AvailabilityNux:            nil,
 		Upgrade:                    nil,
 		BaseInstructions:           transformPrompt(stringField(template, "base_instructions"), spec.ModelName),
-		SupportsReasoningSummaries: true,
+		SupportsReasoningSummaries: spec.SupportsReasoningNotes,
 		DefaultReasoningSummary:    "auto",
 		SupportVerbosity:           false,
 		DefaultVerbosity:           nil,
@@ -648,6 +730,15 @@ func deepseekReasoningLevels() []reasoningLevel {
 	return []reasoningLevel{
 		{Effort: "high", Description: "High reasoning effort"},
 		{Effort: "xhigh", Description: "Extra high reasoning effort (maps to DeepSeek max)"},
+	}
+}
+
+func codexReasoningLevels() []reasoningLevel {
+	return []reasoningLevel{
+		{Effort: "low", Description: "Fast responses with lighter reasoning"},
+		{Effort: "medium", Description: "Balances speed and reasoning depth for everyday tasks"},
+		{Effort: "high", Description: "Greater reasoning depth for complex problems"},
+		{Effort: "xhigh", Description: "Extra high reasoning depth for complex problems"},
 	}
 }
 
@@ -772,8 +863,11 @@ func statsigResult(command string, stats statsigStats, changed bool, details []s
 		return result{Name: "Statsig", Status: "FAIL", Details: details}, errors.New("statsig verification failed")
 	}
 	if statusCommand(command) {
-		if !stats.AllPresent {
-			return result{Name: "Statsig", Status: "NEEDS_REPAIR", Details: append(details, "DeepSeek models are missing from Statsig available_models; run repair after quitting Codex App.")}, nil
+		if !stats.ModelsPresent {
+			return result{Name: "Statsig", Status: "NEEDS_REPAIR", Details: append(details, "Required models are missing from Statsig available_models; run repair after quitting Codex App.")}, nil
+		}
+		if !stats.FullyPinned {
+			return result{Name: "Statsig", Status: "NEEDS_REPAIR", Details: append(details, "Required models are present, but the Statsig cache is not fully pinned; run repair after quitting Codex App.")}, nil
 		}
 		return result{Name: "Statsig", Status: "OK", Details: details}, nil
 	}
@@ -794,7 +888,7 @@ func statsigResult(command string, stats statsigStats, changed bool, details []s
 }
 
 func copyStatsigSnapshot(dbPath string) (string, error) {
-	tmp, err := os.MkdirTemp("", "codex-deepseek-statsig-*")
+	tmp, err := os.MkdirTemp("", "codex-tokenflux-statsig-*")
 	if err != nil {
 		return "", err
 	}
@@ -827,21 +921,32 @@ func assertLevelDBUnlocked(path string) error {
 }
 
 type statsigStats struct {
-	SeenConfig int
-	Patched    int
-	Already    int
-	AllPresent bool
-	Keys       []string
+	SeenConfig         int
+	Patched            int
+	Already            int
+	Incomplete         int
+	SeenLastModified   int
+	PinnedLastModified int
+	ModelsPresent      bool
+	FullyPinned        bool
+	AllPresent         bool
+	Keys               []string
+	LastModifiedKeys   []string
 }
 
 func (s statsigStats) Details() []string {
 	d := []string{
-		fmt.Sprintf("seenConfig=%d patchCount=%d alreadyComplete=%d allPresent=%v", s.SeenConfig, s.Patched, s.Already, s.AllPresent),
+		fmt.Sprintf("seenConfig=%d changeCount=%d alreadyComplete=%d incomplete=%d seenLastModified=%d pinnedLastModified=%d modelsPresent=%v fullyPinned=%v allPresent=%v", s.SeenConfig, s.Patched, s.Already, s.Incomplete, s.SeenLastModified, s.PinnedLastModified, s.ModelsPresent, s.FullyPinned, s.AllPresent),
 	}
 	if len(s.Keys) > 0 {
 		sort.Strings(s.Keys)
 		d = append(d, "matched keys:")
 		d = append(d, s.Keys...)
+	}
+	if len(s.LastModifiedKeys) > 0 {
+		sort.Strings(s.LastModifiedKeys)
+		d = append(d, "last-modified keys:")
+		d = append(d, s.LastModifiedKeys...)
 	}
 	return d
 }
@@ -861,8 +966,11 @@ func inspectOrPatchStatsig(path string, write bool) (statsigStats, bool, error) 
 		if err != nil {
 			return stats, true, err
 		}
-		stats.AllPresent = verified.AllPresent
 		stats.Already = verified.Already
+		stats.Incomplete = verified.Incomplete
+		stats.ModelsPresent = verified.ModelsPresent
+		stats.FullyPinned = verified.FullyPinned
+		stats.AllPresent = verified.AllPresent
 	}
 	return stats, changed, nil
 }
@@ -880,11 +988,30 @@ func inspectOrPatchStatsigOnce(path string, write bool) (statsigStats, bool, err
 	for iter.Next() {
 		key := append([]byte(nil), iter.Key()...)
 		value := append([]byte(nil), iter.Value()...)
+		if bytes.Contains(key, []byte("statsig.last_modified_time.evaluations")) {
+			body, prefix := splitStoredValue(value)
+			patchedBody, changed, err := patchStatsigLastModifiedBody(body)
+			if err != nil {
+				continue
+			}
+			stats.SeenLastModified++
+			stats.LastModifiedKeys = append(stats.LastModifiedKeys, printableKey(key))
+			if changed {
+				if write {
+					if err := db.Put(key, append([]byte(prefix), patchedBody...), nil); err != nil {
+						return stats, false, err
+					}
+				}
+				stats.Patched++
+				stats.PinnedLastModified++
+			}
+			continue
+		}
 		if !bytes.Contains(key, []byte("statsig.cached.evaluations")) {
 			continue
 		}
 		body, prefix := splitStoredValue(value)
-		patchedBody, seen, changed, complete, err := patchStatsigBody(body)
+		patchedBody, seen, changed, modelsComplete, fullyPinned, err := patchStatsigBody(body)
 		if err != nil {
 			continue
 		}
@@ -893,8 +1020,11 @@ func inspectOrPatchStatsigOnce(path string, write bool) (statsigStats, bool, err
 		}
 		stats.SeenConfig++
 		stats.Keys = append(stats.Keys, printableKey(key))
-		if complete && !changed {
+		if modelsComplete && fullyPinned && !changed {
 			stats.Already++
+		}
+		if !modelsComplete {
+			stats.Incomplete++
 		}
 		if changed {
 			if write {
@@ -908,7 +1038,9 @@ func inspectOrPatchStatsigOnce(path string, write bool) (statsigStats, bool, err
 	if err := iter.Error(); err != nil {
 		return stats, false, err
 	}
-	stats.AllPresent = stats.SeenConfig > 0 && stats.Patched == 0
+	stats.ModelsPresent = stats.SeenConfig > 0 && stats.Incomplete == 0
+	stats.FullyPinned = stats.ModelsPresent && stats.Patched == 0
+	stats.AllPresent = stats.ModelsPresent && stats.FullyPinned
 	return stats, stats.Patched > 0, nil
 }
 
@@ -931,34 +1063,34 @@ func splitStoredValue(value []byte) ([]byte, string) {
 	return value, ""
 }
 
-func patchStatsigBody(body []byte) ([]byte, bool, bool, bool, error) {
+func patchStatsigBody(body []byte) ([]byte, bool, bool, bool, bool, error) {
 	var outer map[string]any
 	if err := json.Unmarshal(body, &outer); err != nil {
-		return nil, false, false, false, err
+		return nil, false, false, false, false, err
 	}
 	dataText, ok := outer["data"].(string)
 	if !ok {
-		return nil, false, false, false, nil
+		return nil, false, false, false, false, nil
 	}
 	var inner map[string]any
 	if err := json.Unmarshal([]byte(dataText), &inner); err != nil {
-		return nil, false, false, false, err
+		return nil, false, false, false, false, err
 	}
 	dyn, ok := inner["dynamic_configs"].(map[string]any)
 	if !ok {
-		return nil, false, false, false, nil
+		return nil, false, false, false, false, nil
 	}
 	cfg, ok := dyn[statsigConfigID].(map[string]any)
 	if !ok {
-		return nil, false, false, false, nil
+		return nil, false, false, false, false, nil
 	}
 	value, ok := cfg["value"].(map[string]any)
 	if !ok {
-		return nil, true, false, false, nil
+		return nil, true, false, false, false, nil
 	}
 	rawModels, ok := value["available_models"].([]any)
 	if !ok {
-		return nil, true, false, false, nil
+		return nil, true, false, false, false, nil
 	}
 	existing := map[string]bool{}
 	for _, raw := range rawModels {
@@ -967,26 +1099,113 @@ func patchStatsigBody(body []byte) ([]byte, bool, bool, bool, error) {
 		}
 	}
 	changed := false
-	for _, slug := range []string{flashSlug, proSlug} {
+	modelsComplete := true
+	for _, slug := range requiredPickerModelSlugs() {
 		if !existing[slug] {
+			modelsComplete = false
 			rawModels = append(rawModels, slug)
 			changed = true
 		}
 	}
+	fullyPinned := outer["source"] == statsigPinnedSource &&
+		numberPinned(outer, "receivedAt") &&
+		numberPinned(outer, "time") &&
+		numberPinned(inner, "time") &&
+		numberPinned(inner, "company_lcut")
+	if outer["source"] != statsigPinnedSource {
+		outer["source"] = statsigPinnedSource
+		changed = true
+	}
+	if pinNumber(outer, "receivedAt") {
+		changed = true
+	}
+	if pinNumber(outer, "time") {
+		changed = true
+	}
+	if pinNumber(inner, "time") {
+		changed = true
+	}
+	if pinNumber(inner, "company_lcut") {
+		changed = true
+	}
 	if !changed {
-		return body, true, false, true, nil
+		return body, true, false, modelsComplete, fullyPinned, nil
 	}
 	value["available_models"] = rawModels
 	innerData, err := json.Marshal(inner)
 	if err != nil {
-		return nil, true, false, false, err
+		return nil, true, false, false, false, err
 	}
 	outer["data"] = string(innerData)
 	out, err := json.Marshal(outer)
 	if err != nil {
-		return nil, true, false, false, err
+		return nil, true, false, false, false, err
 	}
-	return out, true, true, true, nil
+	return out, true, true, modelsComplete, false, nil
+}
+
+func patchStatsigLastModifiedBody(body []byte) ([]byte, bool, error) {
+	var outer map[string]any
+	if err := json.Unmarshal(body, &outer); err != nil {
+		return nil, false, err
+	}
+	changed := false
+	for key := range outer {
+		if pinExistingNumber(outer, key) {
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false, nil
+	}
+	out, err := json.Marshal(outer)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
+}
+
+func pinNumber(object map[string]any, key string) bool {
+	current, ok := numericValue(object[key])
+	if !ok || current < statsigFutureTimestampMillis {
+		object[key] = statsigFutureTimestampMillis
+		return true
+	}
+	return false
+}
+
+func pinExistingNumber(object map[string]any, key string) bool {
+	current, ok := numericValue(object[key])
+	if ok && current < statsigFutureTimestampMillis {
+		object[key] = statsigFutureTimestampMillis
+		return true
+	}
+	return false
+}
+
+func numberPinned(object map[string]any, key string) bool {
+	current, ok := numericValue(object[key])
+	return ok && current >= statsigFutureTimestampMillis
+}
+
+func numericValue(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case json.Number:
+		f, err := v.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func lockOwners(dbPath string) []string {
@@ -1056,7 +1275,7 @@ func backupRoot() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".codex", "deepseek-installer-backups", time.Now().Format("20060102-150405")), nil
+	return filepath.Join(home, ".codex", "tokenflux-model-installer-backups", time.Now().Format("20060102-150405")), nil
 }
 
 func copyFile(src, dst string) error {
